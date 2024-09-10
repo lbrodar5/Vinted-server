@@ -6,9 +6,26 @@ const bcrypt = require("bcrypt");
 const jwt = require('jsonwebtoken');
 const multer = require("multer");
 const fs = require("fs");
+const {Storage} = require('@google-cloud/storage');
 
-const upload = multer({ dest: "images/" });
+const multerGoogleStorage = require("multer-cloud-storage");
 
+require("dotenv").config()
+
+const storage = new Storage({projectId: process.env.GCLOUD_PROJECT,credentials: {client_email: process.env.CLIENT_EMAIL, private_key: process.env.VINTED_PRIVATE_KEY}  })
+
+// const upload = multer({ 
+//     storage: multer.memoryStorage(),
+//     limits:{
+//         fileSize: 5 * 1024 * 1024
+//     }
+//  });
+
+const upload = multer({
+    storage: multerGoogleStorage.storageEngine({projectId: process.env.GCLOUD_PROJECT, bucket: process.env.VINTED_BUCKET,credentials: {client_email: process.env.CLIENT_EMAIL, private_key: process.env.VINTED_PRIVATE_KEY}})
+  });
+
+const bucket = storage.bucket(process.env.VINTED_BUCKET);
 
 const { connect_to_db, ObjectId} = require("./db");
 
@@ -58,17 +75,37 @@ const io = new Server(httpServer, {
         }
     });
 
-    app.get( "/api/image/:id", async (req,res)=> {
+    app.get("/api/image/:id", async (req, res) => {
         const id = req.params.id;
         try {
-            const image = await db.collection("images").findOne({_id : new ObjectId(id)});
-            res.download(image.path, image.originalname);
-        } catch(e) {
+            // Find image metadata in MongoDB
+            const image = await db.collection("images").findOne({_id: new ObjectId(id)});
+            
+            if (!image) {
+                return res.status(404).send({error: "Image not found."});
+            }
+    
+            // Use the filename or URL stored in your MongoDB collection
+            const file = bucket.file(image.filename);  // `image.filename` is stored when you upload using multer-cloud-storage
+    
+            // Stream the file from Google Cloud Storage to the response
+            file.createReadStream()
+                .on('error', (err) => {
+                    console.error(err);
+                    res.status(500).send({error: "Unable to download the image."});
+                })
+                .on('response', (fileResponse) => {
+                    // Set headers for file download
+                    res.setHeader('Content-Type', fileResponse.headers['content-type']);
+                    res.setHeader('Content-Disposition', `attachment; filename="${image.filename}"`);
+                })
+                .pipe(res);  // Pipe the file data to the response
+        } catch (e) {
             console.log(e);
+            res.status(500).send({error: "Something went wrong."});
         }
-
     });
-
+    
 
     app.post("/api/register",async (req,res) => {
         let {username, password} = req.body;
@@ -122,24 +159,48 @@ const io = new Server(httpServer, {
 
     });
 
-    app.delete("/api/article/:id", async (req,res) => {
-        const id = req.params.id
+    app.delete("/api/article/:id", async (req, res) => {
+        const id = req.params.id;
         try {
+            // Find the article in the database
             const article = await db.collection("articles").findOne({_id: new ObjectId(id)});
-            article.images.forEach(async imgId => {
-                const image = await db.collection("images").findOne({_id : new ObjectId(imgId)})
-                fs.unlink(image.path, (err) => { 
-                    if (err)  console.log(err);
-                });
-                const resp = await db.collection("images").deleteOne({_id : image._id});
-            });
-            const delResp = await db.collection("articles").deleteOne({_id : article._id});
-            io.emit('remove',{id: article._id});
-            res.send({message: "Done."})
-        } catch(e){
+    
+            if (!article) {
+                return res.status(404).send({error: "Article not found."});
+            }
+    
+            // Iterate over all images in the article and delete them
+            for (let imgId of article.images) {
+                const image = await db.collection("images").findOne({_id: new ObjectId(imgId)});
+                
+                if (!image) {
+                    console.log(`Image with id ${imgId} not found.`);
+                    continue;
+                }
+    
+                // Delete the image from Google Cloud Storage
+                const file = bucket.file(image.filename); // assuming image.filename holds the file name stored in Google Cloud
+                await file.delete();
+    
+                // Delete the image from the MongoDB database
+                await db.collection("images").deleteOne({_id: image._id});
+            }
+    
+            // Delete the article itself
+            await db.collection("articles").deleteOne({_id: article._id});
+            
+            // Emit an event to notify clients that the article has been removed
+            io.emit('remove', {id: article._id});
+            
+            // Send response back to the client
+            res.send({message: "Article and associated images successfully deleted."});
+    
+        } catch (e) {
             console.log(e);
+            res.status(500).send({error: "Something went wrong while deleting the article and its images."});
         }
-    }) 
+    });
+    
     
 
     io.on("connection", (socket) => { 
